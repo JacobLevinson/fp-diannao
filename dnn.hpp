@@ -33,6 +33,9 @@ VTYPE transfer(VTYPE i) {
   return (i>0) ? i : i/4;
 }
 
+__host__ __device__ static __forceinline__
+float transfer_d(float x) { return (x > 0.f) ? x : x * 0.25f; }
+
 void compare(VTYPE* neuron1, VTYPE* neuron2, int size) {
   bool error = false;
   for(int i = 0; i < size; ++i) {
