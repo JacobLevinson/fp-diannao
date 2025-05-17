@@ -1,145 +1,169 @@
 #!/usr/bin/env python3
 """
-Analytical performance model for a single-precision 2-D convolution kernel.
+model.py — Memory-bound fixed-intensity roofline model with error stats
 
-* Everything is parameterized: problem size, tile size, hardware limits.
-* For now we implement:
-    – FLOP count
-    – Nominal DRAM bytes (1 load / 1 store per element)
-    – Compute-bound time  (FLOP / peak_flops)
-    – DRAM-bound time     (bytes / dram_bw)
-    – Predicted runtime   = max(compute, dram) + launch_overhead
-* Later you can add L2/L1 stages, latency penalties, etc.
+This model targets the optimized conv2d kernel which:
+  • Does no spatial reuse in software (no shared-memory tiling),
+    so its arithmetic intensity is fixed at 0.25 FLOP/Byte.
+      - Each output element computes Ni*Kx*Ky multiplies + adds ⇒ 2·Ni·Kx·Ky FLOPs
+      - And loads Ni·Kx·Ky weights + Ni·Kx·Ky activations = 2·Ni·Kx·Ky elements
+        at 4 bytes each ⇒ 8·Ni·Kx·Ky bytes
+      - Arithmetic intensity = (2·Ni·Kx·Ky FLOPs) / (8·Ni·Kx·Ky bytes)
+                           = 0.25 FLOP/Byte
+  • Is purely memory-bound: DRAM traffic (bytes) dominates compute.
+  • Still honors occupancy and warp-based latency hiding for completeness,
+    but those only affect the tiny compute term (<1% of total).
+
+Model formulas:
+    flops   = 2 * Nx * Ny * Ni * Nn * Kx * Ky
+      # total FP operations
+
+    T_comp  = flops / (PEAK_FP_nominal × occupancy × warp_hiding)
+      # time to compute all FLOPs
+
+    T_dram  = flops * BYTE_PER_ELT / BW_DRAM_nominal
+      # time to transfer all required bytes from DRAM
+      # since bytes = flops × (1 / 0.25 FLOP/B) = flops × 4 B/F
+
+    T_pred  = LAUNCH_OVERHEAD + max(T_comp, T_dram)
+      # roofline: the slowest of compute vs memory-bound, plus launch latency
 """
 
-from dataclasses import dataclass, asdict
-from typing import Dict, Any
-import json
-import math
+import csv
 
+# ───── Hardware specs ─────
+PEAK_FP_nom        = 13.8e12    # peak single-precision FLOP/s (Titan V)
+BW_DRAM_nom        = 652e9      # peak DRAM bandwidth in bytes/s
+BYTE_PER_ELT       = 4          # bytes per float element
 
-# ──────────────────────────────────────────────────────────────
-# 1.  Data classes for clean parameter passing
-# ──────────────────────────────────────────────────────────────
+# Occupancy / latency-hiding parameters (for compute term)
+MAX_THREADS_PER_SM = 2048       # threads per SM
+MAX_BLOCKS_PER_SM  = 32         # blocks per SM
+FMA_LATENCY_CYCLES = 32         # FMA pipeline latency in cycles
+CORE_CLOCK         = 1455e6     # Hz (if more precise warp_hiding needed)
 
-@dataclass
-class Problem:
-    Nx: int; Ny: int         # spatial size
-    Ni: int; Nn: int         # channels   (in/out)
-    Kx: int = 3; Ky: int = 3 # kernel
-    Sx: int = 1; Sy: int = 1 # stride
+# Kernel launch overhead (measured)
+LAUNCH_OVERHEAD    = 5e-6       # seconds
 
-@dataclass
-class Tile:
-    Tx: int; Ty: int
-    Ti: int; Tn: int
+def compute_times(row):
+    # ─── parse kernel/prob parameters ───
+    Nx, Ny = int(row['Nx']), int(row['Ny'])
+    Ni, Nn = int(row['Ni']), int(row['Nn'])
+    Kx, Ky = int(row['Kx']), int(row['Ky'])
+    Tx, Ty = int(row['Tx']), int(row['Ty'])
+    Tn, Ti = int(row['Tn']), int(row['Ti'])
 
-@dataclass
-class Hardware:
-    peak_flops: float = 13.8e12
-    dram_bw:    float = 652e9
-    launch_us:  float = 5.0
-    dtype_bytes:int   = 4
-    util_compute: float = 0.75     # 75 % of peak
-    traffic_mul: float = 3.0       # see text
+    # ─── compute total FLOPs ───
+    # each output does Ni*Kx*Ky multiplies + Ni*Kx*Ky adds = 2·Ni·Kx·Ky
+    flops = 2 * Nx * Ny * Ni * Nn * Kx * Ky
 
-# ──────────────────────────────────────────────────────────────
-# 2.  Core model
-# ──────────────────────────────────────────────────────────────
+    # ─── occupancy factor ───
+    # how many threads per block, scaled by SM capacity
+    threads_per_block = Tx * Ty * Tn
+    occ = min(1.0,
+              (threads_per_block * MAX_BLOCKS_PER_SM) /
+              MAX_THREADS_PER_SM)
 
-class ConvModel:
-    def __init__(self, prob: Problem, tile: Tile, hw: Hardware):
-        self.p = prob
-        self.t = tile
-        self.hw = hw
+    # ─── warp‐based latency hiding ───
+    # need enough warps to hide FMA latency
+    warps_per_block = threads_per_block / 32
+    warps_per_SM    = warps_per_block * MAX_BLOCKS_PER_SM
+    warp_hiding     = min(1.0,
+                         warps_per_SM / FMA_LATENCY_CYCLES)
 
-    # ---------- basic geometry ----------
+    # ─── effective compute throughput (FLOP/s) ───
+    eff_fp = PEAK_FP_nom * occ * warp_hiding
 
-    @property
-    def flops(self) -> int:
-        p = self.p
-        # 2 = FMA   (mul + add)  per overlapping window
-        return p.Ny * p.Nx * p.Nn * 2 * p.Ky * p.Kx * p.Ni
+    # ─── effective memory throughput (B/s) ───
+    # kernel is memory‐bound, assume full DRAM saturation
+    eff_bw = BW_DRAM_nom
 
-    @property
-    def bytes_dram(self) -> int:
-        """Naïve traffic (no reuse counted)."""
-        p, B = self.p, self.hw.dtype_bytes
-        weights = p.Ky * p.Kx * p.Ni * p.Nn * B
-        activ_in  = (p.Ny + p.Ky) * (p.Nx + p.Kx) * p.Ni * B
-        activ_out = p.Ny * p.Nx * p.Nn * B
-        return weights + activ_in + activ_out
+    # ─── time components (seconds) ───
+    T_comp = flops / eff_fp
+    # since arithmetic intensity is 0.25 F/B, bytes = flops × 4
+    T_dram = flops * BYTE_PER_ELT / eff_bw
 
-    # ---------- simple roofline-style latency ----------
+    # ─── final predicted time ───
+    T_pred = LAUNCH_OVERHEAD + max(T_comp, T_dram)
 
-    @property
-    def t_compute(self) -> float:
-        return self.flops / (self.hw.peak_flops * self.hw.util_compute)
+    # return all timings in milliseconds
+    return T_comp*1e3, T_dram*1e3, T_pred*1e3
 
-    @property
-    def t_dram(self) -> float:
-        bytes_eff = self.bytes_dram * self.hw.traffic_mul
-        return bytes_eff / self.hw.dram_bw
+def main():
+    input_csv = 'sweep_results.csv'
+    data = list(csv.DictReader(open(input_csv)))
+    results = []
 
-    # ---------- predicted total runtime ----------
-
-    def runtime_pred_ms(self) -> float:
-        base_s = max(self.t_compute, self.t_dram)
-        total_s = base_s + self.hw.launch_us * 1e-6
-        return total_s * 1e3
-
-    # ---------- convenience dump ----------
-
-    def dict(self) -> Dict[str, Any]:
-        d = asdict(self.p) | asdict(self.t)
-        d.update({
-            "flops": self.flops,
-            "bytes_dram": self.bytes_dram,
-            "t_compute_ms": self.t_compute * 1e3,
-            "t_dram_ms":    self.t_dram    * 1e3,
-            "pred_ms":      self.runtime_pred_ms()
+    # ─── evaluate model on each sweep point ───
+    for row in data:
+        t_comp, t_dram, t_pred = compute_times(row)
+        actual = float(row['time_ms'])
+        error  = (t_pred - actual) / actual * 100
+        results.append({
+            'row': row,
+            'actual':      actual,
+            'pred':        t_pred,
+            'error':       error,
+            'abs_error':   abs(error),
+            't_comp':      t_comp,
+            't_dram':      t_dram
         })
-        return d
 
+    # ─── compute summary statistics ───
+    n        = len(results)
+    mean_err = sum(r['error'] for r in results) / n
+    mean_abs = sum(r['abs_error'] for r in results) / n
 
-# ──────────────────────────────────────────────────────────────
-# 3.  Quick demo / CLI
-# ──────────────────────────────────────────────────────────────
+    # sort by absolute error for min/median/max cases
+    sorted_results = sorted(results, key=lambda r: r['abs_error'])
+    min_rec = sorted_results[0]
+    med_rec = sorted_results[n//2]
+    max_rec = sorted_results[-1]
 
-if __name__ == "__main__":
-    import argparse, textwrap, csv, sys
+    # ─── print high-level summary ───
+    print(f"Points evaluated : {n}")
+    print(f"Mean error       : {mean_err:.2f}%")
+    print(f"Mean abs % error : {mean_abs:.2f}%\n")
 
-    ap = argparse.ArgumentParser(
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=textwrap.dedent("""
-        Simple test run:
-            $ python model.py --meas_ms 19.0
+    # helper to print detailed case breakdown
+    def print_case(label, rec):
+        r = rec['row']
+        print(f"{label} abs error: {rec['abs_error']:.2f}%")
+        print(f"  Params: Tx={r['Tx']}, Ty={r['Ty']}, Tn={r['Tn']}, Ti={r['Ti']}, "
+              f"Nx={r['Nx']}, Ny={r['Ny']}, Ni={r['Ni']}, Nn={r['Nn']}")
+        print(f"  actual    = {rec['actual']:.3f} ms")
+        print(f"  predicted = {rec['pred']:.3f} ms")
+        print(f"    breakdown: T_comp = {rec['t_comp']:.3f} ms, "
+              f"T_dram = {rec['t_dram']:.3f} ms\n")
 
-        Pass  --json  to dump all intermediate numbers.
-        """))
+    # ─── print min, median, max error cases ───
+    print_case("Min   ",    min_rec)
+    print_case("Median",    med_rec)
+    print_case("Max   ",    max_rec)
 
-    ap.add_argument("--Nx", type=int, default=224)
-    ap.add_argument("--Ny", type=int, default=224)
-    ap.add_argument("--Ni", type=int, default=64)
-    ap.add_argument("--Nn", type=int, default=64)
-    ap.add_argument("--Tx", type=int, default=7)
-    ap.add_argument("--Ty", type=int, default=7)
-    ap.add_argument("--Ti", type=int, default=16)
-    ap.add_argument("--Tn", type=int, default=16)
-    ap.add_argument("--meas_ms", type=float, help="Measured kernel time to compare against")
-    ap.add_argument("--json", action="store_true", help="Print full JSON dump")
+    # ─── save detailed CSV of predictions ───
+    output_csv = 'model_predictions.csv'
+    with open(output_csv, 'w', newline='') as fout:
+        writer = csv.writer(fout)
+        writer.writerow([
+            'Tx','Ty','Tn','Ti',
+            'Nx','Ny','Ni','Nn','Kx','Ky',
+            'actual_ms','t_comp_ms','t_dram_ms','pred_ms','error_pct'
+        ])
+        for rec in results:
+            r = rec['row']
+            writer.writerow([
+                r['Tx'], r['Ty'], r['Tn'], r['Ti'],
+                r['Nx'], r['Ny'], r['Ni'], r['Nn'],
+                r['Kx'], r['Ky'],
+                f"{rec['actual']:.6f}",
+                f"{rec['t_comp']:.6f}",
+                f"{rec['t_dram']:.6f}",
+                f"{rec['pred']:.6f}",
+                f"{rec['error']:.2f}"
+            ])
 
-    args = ap.parse_args()
+    print(f"Detailed results saved to {output_csv}")
 
-    prob = Problem(args.Nx, args.Ny, args.Ni, args.Nn)
-    tile = Tile(args.Tx, args.Ty, args.Ti, args.Tn)
-    model = ConvModel(prob, tile, Hardware())
-
-    if args.json:
-        print(json.dumps(model.dict(), indent=2))
-    else:
-        print(f"Predicted: {model.runtime_pred_ms():.3f} ms")
-
-    if args.meas_ms:
-        err = (model.runtime_pred_ms() - args.meas_ms) / args.meas_ms * 100
-        print(f"Measured : {args.meas_ms:.3f} ms   →  error = {err:+.1f}%")
+if __name__ == '__main__':
+    main()

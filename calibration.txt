@@ -1,0 +1,3 @@
+# Calibration results:
+PEAK_FP_eff = 1.647255e+11  # effective GFLOP/s
+BW_DRAM_eff = 6.520000e+11  # effective B/s
