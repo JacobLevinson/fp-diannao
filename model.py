@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-model_enhanced.py — Mechanistic performance model with SPAD & classic DRAM roofline
+model.py — Mechanistic performance model with SPAD & classic DRAM roofline
 
 This model predicts conv2d timings combining:
   • Compute-bound roof (T_comp)
   • DRAM-bound roofline (T_dram) using fixed intensity (0.25 FLOP/B)
   • Shared-mem (SPAD) path with:
-      – per-SM resource limits (threads + SPAD capacity)
-      – wave-based DRAM loads
-      – measured SPAD inefficiency factor on throughput
-      – per-block shared-mem latency overhead
+       per-SM resource limits (threads + SPAD capacity)
+       wave-based DRAM loads
+       measured SPAD inefficiency factor on throughput
+       per-block shared-mem latency overhead
   • Launch overhead (T_launch)
   • Memory-latency penalty (T_lat)
 
