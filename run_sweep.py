@@ -10,8 +10,8 @@ import csv, itertools, subprocess, re, pathlib, shutil, sys
 
 # ────────── sweep configuration ──────────
 square_tiles = [8, 16, 32]          # Tx = Ty  ⇒ 3 spatial-tile sizes
-tile_Tn      = [8, 16, 32]          # output-channel tile sizes
-tile_Ti      = [8, 16]              # input-channel  tile sizes
+tile_Tn      = [4, 8, 16]          # output-channel tile sizes
+tile_Ti      = [4, 8, 16]              # input-channel  tile sizes
 
 Nx_list      = [224, 112, 56, 28]   # ← dropped 14 to shorten sweep
 Ny_list      = Nx_list              # keep square inputs
@@ -37,12 +37,10 @@ def run_one(args):
     m = time_rx.search(proc.stdout);  return float(m.group(1)) if m else None
 
 # ────────── CSV setup ──────────
-write_header = not CSV_PATH.exists()
-with CSV_PATH.open("a", newline="") as fp:
+with CSV_PATH.open("w", newline="") as fp:
     writer = csv.writer(fp)
-    if write_header:
-        writer.writerow(["Tx","Ty","Tn","Ti",
-                         "Nx","Ny","Ni","Nn","Kx","Ky","time_ms"])
+    writer.writerow(["Tx","Ty","Tn","Ti",
+                     "Nx","Ny","Ni","Nn","Kx","Ky","time_ms"])
 
     # ────────── sweep ──────────
     for Tx, Tn, Ti in itertools.product(square_tiles, tile_Tn, tile_Ti):
